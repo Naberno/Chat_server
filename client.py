@@ -303,6 +303,7 @@ class ChatClientGUI:
         except Exception as e:
             messagebox.showerror("Ошибка", f"Не удалось присоединиться к каналу: {e}")
 
+
     def show_chat_interface(self):
         self.clear_frame()
 
@@ -632,40 +633,25 @@ class ChatClientGUI:
             return
 
         try:
-            # Создаем структурированное сообщение с токеном
             message_data = {
                 "action": "send_message",
                 "channel": self.current_channel,
                 "message": message,
-                "token": self.token  # Добавляем сохраненный токен
+                "token": self.token
             }
 
-            # Преобразуем словарь в JSON и отправляем
-            formatted_message = json.dumps(message_data)
-            self.conn.send(formatted_message.encode('utf-8'))
+            # Отправляем сообщение
+            self.conn.send(json.dumps(message_data).encode('utf-8'))
 
-            # Очищаем поле ввода
+            # Очищаем поле ввода сразу после отправки
             self.message_entry.delete(0, tk.END)
 
-            # Получаем ответ от сервера
-            response = self.conn.recv(1024).decode('utf-8')
-            response_data = json.loads(response)
+            # Добавляем сообщение в чат локально (не ждем подтверждения от сервера)
+            self.add_message_to_chat(f"{self.nickname}: {message}")
 
-            # Обрабатываем ответ
-            if response_data["status"] == "error":
-                if "token" in response_data["message"].lower():
-                    # Если проблема с токеном, можно попробовать переподключиться
-                    messagebox.showerror("Ошибка", "Сессия истекла. Необходимо повторно войти в систему")
-                    self.show_login_fields()  # Показываем окно входа
-                else:
-                    messagebox.showerror("Ошибка", response_data["message"])
-
-        except json.JSONDecodeError:
-            messagebox.showerror("Ошибка", "Получен некорректный ответ от сервера")
-            self.reconnect()
         except Exception as e:
+            print(f"Ошибка при отправке сообщения: {e}")
             messagebox.showerror("Ошибка", f"Не удалось отправить сообщение: {e}")
-            self.reconnect()
 
     def receive_messages(self):
         while not self.stop_thread.is_set():
@@ -679,20 +665,50 @@ class ChatClientGUI:
 
                 print(f"Получено сообщение: {message}")  # Отладка
 
-                if message.startswith("MESSAGE"):
-                    _, sender, content = message.split(" ", 2)
-                    self.add_message_to_chat(f"{sender}: {content}")
-                elif message.startswith("SYSTEM"):
-                    _, content = message.split(" ", 1)
-                    self.add_message_to_chat(f"[Система] {content}")
-                elif message == "PING":
-                    self.conn.send("PONG".encode('utf-8'))
+                try:
+                    data = json.loads(message)
+                    if data.get("status") == "success":
+                        if data.get("action") == "channel_history":
+                            self.chat_area.configure(state=tk.NORMAL)
+                            self.chat_area.delete(1.0, tk.END)
+                            messages = data.get("messages", [])
+                            for msg in reversed(messages):  # Отображаем сообщения в хронологическом порядке
+                                self.add_message_to_chat(f"{msg['nickname']}: {msg['message']}")
+                            self.chat_area.configure(state=tk.DISABLED)
+                        elif "message" in data:
+                            logging.info(f"Сервер подтвердил отправку: {data['message']}")
+                        else:
+                            pass  # Игнорируем дополнительные подтверждения успеха
+                    elif data.get("status") == "error":
+                        logging.error(f"Ошибка от сервера: {data.get('message', 'Неизвестная ошибка')}")
+                    else:
+                        if data.get("type") == "chat_message":
+                            self.add_message_to_chat(f"{data['sender']}: {data['message']}")
+                        else:
+                            logging.warning(f"Неизвестный формат сообщения: {data}")
+
+                except json.JSONDecodeError:
+                    # Обработка обычных текстовых сообщений
+                    if message.startswith("CHANNEL_MESSAGE"):
+                        _, channel, content = message.split(" ", 2)
+                        if channel == self.current_channel:
+                            self.add_message_to_chat(content)
+                    elif message.startswith("MESSAGE"):
+                        _, sender, content = message.split(" ", 2)
+                        self.add_message_to_chat(f"{sender}: {content}")
+                    elif message.startswith("SYSTEM"):
+                        _, content = message.split(" ", 1)
+                        self.add_message_to_chat(f"[Система] {content}")
+                    elif message == "PING":
+                        self.conn.send("PONG".encode('utf-8'))
 
             except Exception as e:
                 print(f"Ошибка при получении сообщения: {e}")
                 if not self.stop_thread.is_set():
                     self.reconnect()
                 break
+
+        print("Поток приема сообщений завершен")
 
     def add_message_to_chat(self, message):
         if not self.chat_area:
@@ -706,6 +722,20 @@ class ChatClientGUI:
         # Сохраняем сообщение в истории
         with open(self.history_file, 'a', encoding='utf-8') as f:
             f.write(f"{message}\n")
+
+    def request_channel_history(self):
+        if not self.current_channel:
+            return
+
+        try:
+            message_data = {
+                "action": "get_channel_history",
+                "channel": self.current_channel,
+                "token": self.token
+            }
+            self.conn.send(json.dumps(message_data).encode('utf-8'))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось загрузить историю сообщений: {e}")
 
     def leave_chat(self):
         try:
@@ -731,12 +761,20 @@ class ChatClientGUI:
                     email = config['credentials']['email']
                     password = config['credentials']['password']
                     self.perform_login(email, password)
-            else:
-                messagebox.showerror("Ошибка", "Не удалось переподключиться к серверу")
-                self.load_login_frame()
+
+                    # Если были в канале, переподключаемся к нему
+                    if hasattr(self, 'current_channel') and self.current_channel:
+                        self.join_channel(self.current_channel)
+                    return True
+
+            messagebox.showerror("Ошибка", "Не удалось переподключиться к серверу")
+            self.load_login_frame()
+            return False
+
         except Exception as e:
             messagebox.showerror("Ошибка", f"Ошибка при переподключении: {e}")
             self.load_login_frame()
+            return False
 
     def change_nickname_dialog(self):
         new_nickname = simpledialog.askstring("Изменить никнейм", "Введите новый никнейм:")
