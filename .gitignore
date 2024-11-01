@@ -163,3 +163,5 @@ cython_debug/
 /database
 run.py
 start.bat
+client_chat_history.txt
+users.db
